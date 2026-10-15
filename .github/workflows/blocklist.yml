@@ -1,0 +1,126 @@
+name: blocklist
+
+# Builds the Pico 2 W ad-blocker list from the sources chosen in lists.conf, every Monday,
+# and publishes it at a fixed URL for the device's "Remote auto-update":
+#   https://github.com/<owner>/<repo>/releases/download/blocklist/blocklist2.bin   (firmware >= v1.2.0)
+#   https://github.com/<owner>/<repo>/releases/download/blocklist/blocklist.bin    (old format, only if it fits)
+# Run it by hand from the Actions tab; choices made there are saved into lists.conf.
+on:
+  schedule:
+    - cron: "17 4 * * 1"   # Mondays 04:17 UTC (12:17 Taipei)
+  workflow_dispatch:
+    inputs:
+      hagezi:
+        description: "Hagezi 主名單"
+        type: choice
+        options: ["(keep)", light, pro, pro.plus, ultimate, none]
+        default: "(keep)"
+      tif:
+        description: "Hagezi 威脅情報"
+        type: choice
+        options: ["(keep)", none, tif.mini]
+        default: "(keep)"
+      stevenblack:
+        description: "StevenBlack 基本名單"
+        type: choice
+        options: ["(keep)", "yes", "no"]
+        default: "(keep)"
+      extra:
+        description: "其他名單網址（空白分隔；(keep) 不變，- 清空）"
+        type: string
+        default: "(keep)"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: blocklist
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Choose sources (lists.conf + manual choices)
+        env:
+          IN_HAGEZI: ${{ inputs.hagezi }}
+          IN_TIF: ${{ inputs.tif }}
+          IN_STEVENBLACK: ${{ inputs.stevenblack }}
+          IN_EXTRA: ${{ inputs.extra }}
+        run: python3 tools/lists.py lists.conf urls.txt summary.txt
+
+      - name: Save choices / keep the schedule alive
+        # GitHub disables scheduled workflows after 60 days without repository activity:
+        # commit when the choices changed, or (empty commit) when the last commit is 50+ days old.
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet lists.conf; then
+            git commit -m "lists.conf: $(cat summary.txt)" lists.conf
+            git push
+          elif [ $(( $(date +%s) - $(git log -1 --format=%ct) )) -gt $(( 50 * 86400 )) ]; then
+            git commit --allow-empty -m "keepalive: scheduled builds stay enabled"
+            git push
+          fi
+
+      - name: Tool tests
+        run: cd tools && python3 -m unittest
+
+      - name: Download sources
+        run: |
+          i=0
+          while read -r url; do
+            i=$((i + 1))
+            echo "downloading $url"
+            curl -fsSL --retry 3 --retry-delay 10 -o "src_$i.txt" "$url"
+          done < urls.txt
+
+      - name: Build
+        run: |
+          python3 tools/build_blocklist.py blocklist2.bin src_*.txt
+          if python3 tools/build_blocklist.py --v1 blocklist.bin src_*.txt > v1.log 2>&1; then
+            echo "old format: written"
+          else
+            echo "old format: does not fit (more than 392,396 entries), not published"; rm -f blocklist.bin
+          fi
+
+      - name: Sanity check
+        run: |
+          entries=$(python3 -c "import struct; print(struct.unpack_from('<I', open('blocklist2.bin','rb').read(), 8)[0])")
+          echo "entries=$entries"
+          test "$entries" -gt 50000          # catches a source that silently shrank
+          echo "ENTRIES=$entries" >> "$GITHUB_ENV"
+
+      - name: Publish to the 'blocklist' release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          base="https://github.com/${{ github.repository }}/releases/download/blocklist"
+          notes="Auto-built $(date -u +%F): ${ENTRIES} entries ($(cat summary.txt)).
+
+          Device Remote auto-update URL (firmware v1.2.0 or later):
+          ${base}/blocklist2.bin"
+          if [ -f blocklist.bin ]; then
+            notes="${notes}
+
+          Older firmware (same list, old format):
+          ${base}/blocklist.bin"
+          fi
+          if gh release view blocklist >/dev/null 2>&1; then
+            gh release edit blocklist --notes "$notes"
+          else
+            gh release create blocklist --title "Weekly blocklist" --notes "$notes" --latest=false
+          fi
+          gh release upload blocklist blocklist2.bin --clobber
+          if [ -f blocklist.bin ]; then
+            gh release upload blocklist blocklist.bin --clobber
+          else
+            gh release delete-asset blocklist blocklist.bin -y 2>/dev/null || true   # never leave a stale copy
+          fi
